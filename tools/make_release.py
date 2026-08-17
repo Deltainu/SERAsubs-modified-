@@ -40,11 +40,14 @@ KEEP_PACKAGES = {
     "distutils-precedence.pth",
 }
 
-# parts of the python folder the app never uses
+# parts of the python folder the app never uses. the renamed launcher is
+# left out on purpose: it is a rewritten copy of python.exe and belongs on
+# the machine that runs it, made by make_launcher.py on the first start
 SKIP_IN_PYTHON = {
     os.path.join("Doc"),
     os.path.join("Lib", "test"),
     os.path.join("Lib", "idlelib"),
+    "SERAsubs-modified-.exe",
 }
 
 # ffmpeg ships three large executables and only one of them is used.

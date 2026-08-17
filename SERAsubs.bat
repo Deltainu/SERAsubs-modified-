@@ -1,5 +1,5 @@
 @echo off
-title SERAsubs
+title SERAsubs-modified-
 cd /d "%~dp0"
 
 rem The only file a user needs to run. Checks that the runtime is present,
@@ -9,13 +9,13 @@ rem the runtime is not in the repository, so tell the two cases apart:
 rem source checkout without a runtime, or a release that was extracted wrong
 if not exist "python\python.exe" (
     echo.
-    echo   SERAsubs can't find its python folder.
+    echo   SERAsubs-modified- can't find its python folder.
     echo.
     if exist "tools\make_release.py" (
         echo   This looks like the source code from GitHub, which doesn't
         echo   include the python runtime.
         echo.
-        echo   Download SERAsubs-x.x.zip from the Releases page instead, or
+        echo   Download SERAsubs-modified-x.x.zip from the Releases page instead, or
         echo   run it yourself with your own python:  python app\serasubs.py
     ) else (
         echo   This usually means the zip wasn't extracted properly. Right click
@@ -25,6 +25,13 @@ if not exist "python\python.exe" (
     pause
     exit /b 1
 )
+
+rem the app runs under a copy of the runtime named after itself, so the task
+rem manager shows SERAsubs rather than a python nobody can place. make_launcher
+rem writes the copy and names it, and falls back to a plain copy on its own
+set "RUNTIME=python\SERAsubs-modified-.exe"
+if not exist "%RUNTIME%" python\python.exe app\make_launcher.py
+if not exist "%RUNTIME%" set "RUNTIME=python\python.exe"
 
 rem any argument re-runs the setup with those options, then starts as normal
 if not "%~1"=="" goto setup
@@ -44,5 +51,8 @@ if errorlevel 1 (
 )
 
 :start
-python\python.exe app\serasubs.py
+rem tells the app it may hide this console once its own window is up. started
+rem by hand from someone's own terminal, it leaves that terminal alone
+set "SERASUBS_LAUNCHER=1"
+"%RUNTIME%" app\serasubs.py
 if errorlevel 1 pause

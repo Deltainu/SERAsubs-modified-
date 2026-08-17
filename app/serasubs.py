@@ -10,11 +10,13 @@
 import sys
 import site
 import os
+import gc
 import glob
 import queue
 import shutil
 import subprocess
 import threading
+import time
 from collections import deque
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -23,6 +25,10 @@ from languages import language_choices, language_name
 from subtitles import cues_from_segments, DEFAULT_STYLE, STYLES
 
 __version__ = "1.0"
+
+# what this fork is called, everywhere it shows: the window, the taskbar,
+# the task manager and the runtime it starts under
+APP_NAME = "SERAsubs-modified-"
 
 
 # This cat was original placed by Sera.
@@ -46,10 +52,42 @@ MODELS = [
     ("Slowest (Higher accuracy)", "large-v3", "2.9 GB"),
 ]
 
+# roughly how much video memory a model needs, weights plus the run itself.
+# a card with less takes the app down instead of reporting anything
+MODEL_VRAM_MB = {
+    "base": 1100,
+    "small": 1700,
+    "large-v3": 4600,
+}
+
 # pre-converted CTranslate2 builds of the Whisper weights
 MODEL_REPO = "Systran/faster-whisper-{}"
 MODEL_PATTERNS = ("*.bin", "*.json", "*.txt", "*.model")
 MODEL_PATTERNS_SUFFIX = tuple(p.lstrip("*") for p in MODEL_PATTERNS)
+
+# int8 is the fastest a processor runs these weights, and this is where the
+# gain from batching flattens out
+CPU_COMPUTE_TYPE = "int8"
+CPU_BATCH_SIZE = 8
+
+# below this share of the file becoming subtitles, the voice filter is the
+# likely reason rather than silence
+MIN_COVERAGE = 0.5
+
+LOG_FILE = "serasubs.log"
+LOG_MAX_BYTES = 512 * 1024
+
+
+# raised when the user presses Stop, so a cancelled run can be told apart
+# from one that actually broke
+class Cancelled(Exception):
+    pass
+
+
+# a download that did not finish. its own type, because retrying it on the
+# processor would download the same thing again
+class DownloadFailed(Exception):
+    pass
 
 def time_format(seconds):
     h = int(seconds // 3600)
@@ -73,6 +111,20 @@ def project_path(relative_path):
     base = getattr(sys, '_MEIPASS', ROOT_DIR)
     return os.path.join(base, relative_path)
 
+# the status line is gone once the window closes, so a run also leaves a
+# note next to the app. it is all there is to go on when a report comes in
+def log(text):
+    path = project_path(LOG_FILE)
+    try:
+        mode = "a"
+        if os.path.isfile(path) and os.path.getsize(path) > LOG_MAX_BYTES:
+            mode = "w"
+        with open(path, mode, encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {text}\n")
+    except OSError:
+        pass
+
+
 # audio decoding happens in python, so ffmpeg is only needed for burning in
 def add_ffmpeg_to_path():
     ffmpeg_bin = project_path(os.path.join("ffmpeg", "bin"))
@@ -91,15 +143,185 @@ def find_ffmpeg():
 # containers that can have subtitles burned into them
 VIDEO_TYPES = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts")
 
+# sound only, all of these decode but there is no picture to burn into
+AUDIO_TYPES = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma")
+
 
 def is_video(path):
     return path.lower().endswith(VIDEO_TYPES)
+
+
+# one list feeds both the file dialog and what the app says it accepts
+def type_filter():
+    return " ".join(f"*{suffix}" for suffix in VIDEO_TYPES + AUDIO_TYPES)
+
+
+def type_summary():
+    return (f"Video:  {', '.join(s.lstrip('.') for s in VIDEO_TYPES)}\n"
+            f"Audio:  {', '.join(s.lstrip('.') for s in AUDIO_TYPES)}\n\n"
+            "Subtitles can only be burned into video.")
 
 
 # stops a console window appearing for every ffmpeg call
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 _nvenc_cache = {}
+
+# nvidia-smi ships with every driver and answers without loading any CUDA
+# library, which is what makes it safe to ask before anything heavy runs
+NVIDIA_SMI = (
+    "nvidia-smi",
+    os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                 "System32", "nvidia-smi.exe"),
+    r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+)
+
+_gpu_cache = {}
+
+
+def _nvidia_smi_rows(query):
+    for exe in NVIDIA_SMI:
+        try:
+            done = subprocess.run(
+                [exe, query, "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=30,
+                creationflags=NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0 and done.stdout.strip():
+            return [[part.strip() for part in line.split(",")]
+                    for line in done.stdout.strip().splitlines()]
+    return None
+
+
+def _ask_nvidia_smi(fields):
+    rows = _nvidia_smi_rows(f"--query-gpu={fields}")
+    # only the first card is used, which is the one CUDA takes too
+    return rows[0] if rows else None
+
+
+# name and video memory of the card, and its compute capability where the
+# driver is new enough to report it
+def gpu_info():
+    if "info" in _gpu_cache:
+        return _gpu_cache["info"]
+
+    info = None
+    answer = _ask_nvidia_smi("name,memory.total")
+    if answer and len(answer) >= 2:
+        try:
+            info = {"name": answer[0], "memory_mb": int(float(answer[1])),
+                    "compute": None}
+        except ValueError:
+            info = None
+
+    if info:
+        # older drivers don't know this field and fail the whole query,
+        # so it is asked for separately
+        capability = _ask_nvidia_smi("compute_cap")
+        if capability:
+            try:
+                info["compute"] = float(capability[0])
+            except ValueError:
+                pass
+
+    _gpu_cache["info"] = info
+    return info
+
+
+# batching multiplies the memory a run needs, so a small card gets smaller
+# batches instead of running out
+def gpu_batch_size():
+    info = gpu_info()
+    memory = info["memory_mb"] if info else 0
+    if memory >= 10000:
+        return 16
+    if memory >= 6000:
+        return 8
+    return 4
+
+
+# free memory is asked for fresh every time, another program can take it at
+# any moment and a cached answer would be worthless
+def gpu_free_memory():
+    answer = _ask_nvidia_smi("memory.free")
+    if not answer:
+        return None
+    try:
+        return int(float(answer[0]))
+    except ValueError:
+        return None
+
+
+# windows keeps these on the card at all times. they use next to nothing and
+# cannot be closed, so naming them as culprits would only mislead
+SYSTEM_GPU_APPS = frozenset({
+    "explorer.exe", "dwm.exe", "sihost.exe", "searchhost.exe",
+    "startmenuexperiencehost.exe", "shellexperiencehost.exe", "shellhost.exe",
+    "textinputhost.exe", "applicationframehost.exe", "lockapp.exe",
+    "phoneexperiencehost.exe", "crossdeviceresume.exe", "widgets.exe",
+    "systemsettings.exe", "nvcontainer.exe", "nvidia overlay.exe",
+    "nvidia share.exe", "nvidia web helper.exe",
+})
+
+
+# which programs are holding the card. windows does not report how much each
+# one takes, so on most machines this is names only
+def gpu_memory_users(most=3):
+    rows = _nvidia_smi_rows("--query-compute-apps=process_name,used_gpu_memory")
+    if not rows:
+        return []
+
+    mine = os.path.basename(sys.executable).lower()
+    users = []
+    for row in rows:
+        if not row or not row[0]:
+            continue
+        name = os.path.basename(row[0])
+        # the driver writes [N/A] or [Insufficient Permissions] in place of
+        # values it will not hand out
+        if name.startswith("[") or name.lower() in SYSTEM_GPU_APPS:
+            continue
+        if name.lower() == mine:
+            continue
+        try:
+            used = int(float(row[1])) if len(row) > 1 else None
+        except ValueError:
+            used = None
+        users.append((name, used))
+
+    users.sort(key=lambda user: user[1] or 0, reverse=True)
+    return users[:most]
+
+
+# returns why this model cannot run on this card, or None if it can.
+# live=False skips asking about free memory, which costs a moment
+def vram_problem(model_name, live=True):
+    info = gpu_info()
+    needed = MODEL_VRAM_MB.get(model_name)
+    if not info or not needed:
+        return None
+
+    if info["memory_mb"] < needed:
+        return (f"the {info['name']} has {info['memory_mb'] / 1024:.1f} GB, "
+                f"this model needs about {needed / 1024:.1f} GB")
+
+    # the card is big enough, but something else may be sitting on it
+    free = gpu_free_memory()
+    if not live or free is None or free >= needed:
+        return None
+
+    problem = (f"only {free / 1024:.1f} GB of the card's "
+               f"{info['memory_mb'] / 1024:.1f} GB are free right now, "
+               f"this model needs about {needed / 1024:.1f} GB")
+
+    users = gpu_memory_users()
+    if users:
+        listed = ", ".join(f"{name} ({used / 1024:.1f} GB)" if used else name
+                           for name, used in users)
+        problem += f" — closing one of these frees some: {listed}"
+    return problem
 
 
 # NVENC encodes much faster than libx264 where card and build support it
@@ -115,13 +337,16 @@ def has_nvenc(ffmpeg):
     return _nvenc_cache[ffmpeg]
 
 
-# runs ffmpeg, reports progress and keeps the last error lines on failure
-def run_ffmpeg(command, work_dir, duration, progress_cb):
+# runs ffmpeg, reports progress and keeps the last error lines on failure.
+# register hands the process out so Stop can end it
+def run_ffmpeg(command, work_dir, duration, progress_cb, register=None):
     process = subprocess.Popen(
         command, cwd=work_dir, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         creationflags=NO_WINDOW,
     )
+    if register:
+        register(process)
 
     tail = deque(maxlen=6)
 
@@ -153,7 +378,7 @@ def run_ffmpeg(command, work_dir, duration, progress_cb):
 
 
 def burn_subtitles(ffmpeg, video_path, srt_path, out_path, duration,
-                   progress_cb, use_gpu):
+                   progress_cb, use_gpu, register=None, stopped=None):
     # the subtitles filter needs windows paths escaped, so ffmpeg is run from
     # the output folder with a plain filename instead
     work_dir = os.path.dirname(os.path.abspath(srt_path))
@@ -179,9 +404,14 @@ def burn_subtitles(ffmpeg, video_path, srt_path, out_path, duration,
                 "-progress", "pipe:1",
                 os.path.abspath(out_path),
             ]
-            ok, problem = run_ffmpeg(command, work_dir, duration, progress_cb)
+            ok, problem = run_ffmpeg(command, work_dir, duration, progress_cb,
+                                     register)
             if ok:
                 return
+            # a killed ffmpeg looks like a failed one, so the audio fallback
+            # must not start a second encode after Stop was pressed
+            if stopped and stopped():
+                raise Cancelled()
     finally:
         try:
             os.remove(temp_srt)
@@ -226,8 +456,8 @@ except ImportError:
     root = tk.Tk()
     root.withdraw()
     messagebox.showerror(
-        "SERAsubs",
-        "SERAsubs isn't set up yet.\n\n"
+        APP_NAME,
+        f"{APP_NAME} isn't set up yet.\n\n"
         "Please run SERAsubs.bat first, it installs everything this needs.",
     )
     sys.exit(1)
@@ -242,15 +472,43 @@ def cuda_available():
         return False
 
 
+# float16 needs a card of the last few generations. asking the library beats
+# guessing, so an older card gets a type it can actually run
+def cuda_compute_type():
+    if "compute" in _gpu_cache:
+        return _gpu_cache["compute"]
+
+    chosen = "float16"
+    try:
+        import ctranslate2
+        supported = ctranslate2.get_supported_compute_types("cuda")
+        for candidate in ("float16", "int8_float16", "int8_float32", "float32"):
+            if candidate in supported:
+                chosen = candidate
+                break
+    except Exception as problem:
+        log(f"could not ask which compute types the card supports: {problem}")
+
+    _gpu_cache["compute"] = chosen
+    return chosen
+
+
+# more threads than physical cores makes this slower, not faster, and past
+# sixteen it drops off sharply
+def cpu_threads():
+    logical = os.cpu_count() or 4
+    return max(1, min(16, logical // 2 if logical > 4 else logical))
+
+
 def device_settings(choice):
     if choice.startswith("GPU"):
-        return "cuda", "float16"
+        return "cuda", cuda_compute_type()
     if choice.startswith("CPU"):
-        return "cpu", "int8"
+        return "cpu", CPU_COMPUTE_TYPE
     # "Auto" prefers the GPU when there is one
     if cuda_available():
-        return "cuda", "float16"
-    return "cpu", "int8"
+        return "cuda", cuda_compute_type()
+    return "cpu", CPU_COMPUTE_TYPE
 
 
 # where a model lives, and how to tell it downloaded completely
@@ -286,10 +544,18 @@ def folder_size(path):
     return total
 
 
-# models are fetched on first use instead of being shipped with the app
-def download_model(model_name, progress_cb):
-    from huggingface_hub import snapshot_download
+# the download runs in its own process purely so that Stop can end it, since
+# the hub library cannot be interrupted from the outside
+DOWNLOAD_SCRIPT = (
+    "import sys\n"
+    "from huggingface_hub import snapshot_download\n"
+    "snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2],\n"
+    "                  allow_patterns=sys.argv[3:])\n"
+)
 
+
+# models are fetched on first use instead of being shipped with the app
+def download_model(model_name, progress_cb, register=None):
     target = model_dir(model_name)
     expected = expected_download_size(model_name)
 
@@ -301,21 +567,80 @@ def download_model(model_name, progress_cb):
         while not stop.wait(0.5):
             progress_cb(min(99, folder_size(target) / expected * 100))
 
-    watcher = None
     if expected:
-        watcher = threading.Thread(target=watch, daemon=True)
-        watcher.start()
+        threading.Thread(target=watch, daemon=True).start()
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", DOWNLOAD_SCRIPT,
+         MODEL_REPO.format(model_name), target, *MODEL_PATTERNS],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        creationflags=NO_WINDOW,
+    )
+    if register:
+        register(process)
 
     try:
-        snapshot_download(
-            repo_id=MODEL_REPO.format(model_name),
-            local_dir=target,
-            allow_patterns=list(MODEL_PATTERNS),
-        )
+        _, problem = process.communicate()
     finally:
         stop.set()
 
+    if process.returncode != 0:
+        # the hub library draws progress bars on the same stream, and one of
+        # those as an error message tells nobody anything
+        useful = [l.strip() for l in problem.splitlines()
+                  if l.strip() and "%|" not in l]
+        raise DownloadFailed(useful[-1] if useful else
+                             "the download stopped before it was finished")
+
     progress_cb(100)
+
+
+# tkinter has no tooltips, so this is one: a small window that appears while
+# the pointer rests on a widget, and on a click as well
+class Bubble:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.window = None
+        self.timer = None
+        widget.bind("<Enter>", lambda _: self.schedule())
+        widget.bind("<Leave>", lambda _: self.hide())
+        widget.bind("<Button-1>", lambda _: self.toggle())
+
+    def schedule(self):
+        self.cancel()
+        self.timer = self.widget.after(300, self.show)
+
+    def cancel(self):
+        if self.timer:
+            self.widget.after_cancel(self.timer)
+            self.timer = None
+
+    def show(self):
+        if self.window:
+            return
+
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        tk.Label(self.window, text=self.text, justify="left",
+                 background="#ffffe0", relief="solid", borderwidth=1,
+                 font=("Arial", 8), padx=6, pady=4, wraplength=210).pack()
+
+        # below the widget, pulled back onto the screen if it would hang off
+        self.window.update_idletasks()
+        x = self.widget.winfo_rootx()
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        room = self.widget.winfo_screenwidth() - self.window.winfo_width() - 8
+        self.window.wm_geometry(f"+{max(8, min(x, room))}+{y}")
+
+    def hide(self):
+        self.cancel()
+        if self.window:
+            self.window.destroy()
+            self.window = None
+
+    def toggle(self):
+        self.hide() if self.window else self.show()
 
 
 class Main:
@@ -323,7 +648,7 @@ class Main:
         #initialization of the main process script
         self.root = root
         self.root.iconbitmap(resource_path("logo_256.ico"))
-        self.root.title("SERAsubs (modified)")
+        self.root.title(APP_NAME)
         self.root.geometry("380x820")
         self.root.minsize(380, 700)
 
@@ -334,6 +659,13 @@ class Main:
         self.model = None
         self.loaded_key = None
         self.running = False
+
+        # set by Stop, read by the worker thread between steps
+        self.cancel = threading.Event()
+
+        # whichever of the killable processes is running right now
+        self.child = None
+        self.child_lock = threading.Lock()
 
         # worker threads post UI updates here
         self.ui_queue = queue.Queue()
@@ -351,12 +683,25 @@ class Main:
             value="Auto" if self.has_cuda else "CPU")
         self.subtitle_style = tk.StringVar(value=DEFAULT_STYLE)
         self.burn = tk.BooleanVar()
+        self.music = tk.BooleanVar()
 
-        tk.Label(root, text="SERAsubs (modified)",
+        # set by a run that found much less speech than the file is long
+        self.hint = ""
+
+        tk.Label(root, text=APP_NAME,
                  font=("Arial", 13, "bold")).pack(pady=8)
 
-        tk.Button(root, text="Select file",
-                  command=self.select_input).pack()
+        picker = tk.Frame(root)
+        picker.pack()
+        tk.Button(picker, text="Select file",
+                  command=self.select_input).pack(side="left")
+
+        # what can be dropped in here, without cluttering the window
+        info = tk.Label(picker, text=" ⓘ", fg="#1a5fb4", cursor="hand2",
+                        font=("Arial", 11))
+        info.pack(side="left")
+        Bubble(info, type_summary())
+
         self.input_label = tk.Label(root, text="File not selected")
         self.input_label.pack(pady=4)
 
@@ -368,16 +713,31 @@ class Main:
         self.build_language_picker(root)
         self.build_settings(root)
 
+        buttons = tk.Frame(root)
+        buttons.pack(pady=10)
+
         self.start_button = tk.Button(
-            root,
+            buttons,
             text="Start",
             command=self.process,
         )
-        self.start_button.pack(pady=10)
+        self.start_button.pack(side="left", padx=4)
+
+        # ends the run, including the download or the encode behind it
+        self.stop_button = tk.Button(
+            buttons,
+            text="Stop",
+            command=self.stop,
+            state="disabled",
+        )
+        self.stop_button.pack(side="left", padx=4)
 
         #just so u know this is the part that got me struggling
-        self.status = tk.Label(root, text="")
-        self.status.pack(pady=4)
+        # wrapped, because saying which program is holding the card takes
+        # more than a few words
+        self.status = tk.Label(root, text="", wraplength=340,
+                               justify="center")
+        self.status.pack(pady=4, fill="x", padx=12)
 
         # progress for downloading, transcribing and burning in
         self.progress = ttk.Progressbar(root, length=300, maximum=100)
@@ -454,6 +814,8 @@ class Main:
 
         self.device_choice.trace_add(
             "write", lambda *_: self.update_device_note())
+        self.model_choice.trace_add(
+            "write", lambda *_: self.update_device_note())
 
         # how much text may be on screen at once, see STYLES in subtitles.py
         tk.Label(frame, text="Subtitle size").grid(
@@ -471,16 +833,44 @@ class Main:
             text="Burn subtitles into the video",
             variable=self.burn,
         )
-        self.burn_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        # the voice filter is trained on speech and drops singing, so music
+        # needs it switched off. it costs speed, which is why it is a choice
+        # and not the default
+        tk.Checkbutton(
+            frame,
+            text="Music or singing (slower, keeps everything)",
+            variable=self.music,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        # without ffmpeg burning cannot work, so disable it visibly
+        self.burn_check.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # says why the checkbox is greyed out, otherwise it just looks broken
+        self.burn_note = tk.Label(frame, text="", font=("Arial", 8), fg="grey",
+                                  wraplength=330, justify="left")
+        self.burn_note.grid(row=6, column=0, columnspan=2, sticky="w")
+
+        self.update_burn_state()
+
+    # burning needs ffmpeg and something to burn into, so for an audio file
+    # the checkbox is switched off rather than left on to fail later
+    def update_burn_state(self):
         if not self.ffmpeg:
             self.burn.set(False)
             self.burn_check.config(state="disabled")
-            tk.Label(frame, text="(needs the ffmpeg folder next to this app)",
-                     font=("Arial", 8), fg="grey").grid(
-                row=5, column=0, columnspan=2, sticky="w")
-            
+            self.burn_note.config(text="(needs the ffmpeg folder next to this app)")
+            return
+
+        if self.input_path and not is_video(self.input_path):
+            self.burn.set(False)
+            self.burn_check.config(state="disabled")
+            self.burn_note.config(
+                text="(that's an audio file, there is no picture to burn into)")
+            return
+
+        self.burn_check.config(state="normal")
+        self.burn_note.config(text="")
+
+
     def refresh_languages(self):
         needle = self.search.get().strip().lower()
         self.visible_codes = [
@@ -533,19 +923,33 @@ class Main:
                     "segment, so switching mid-sentence is fine.")
         self.language_summary.config(text=text)
 
+    def chosen_model(self):
+        choice = self.model_choice.get()
+        return next((short, size) for label, short, size in MODELS
+                    if label == choice)
+
     def update_device_note(self):
         device, compute = device_settings(self.device_choice.get())
         note = f"Will run on {device.upper()} ({compute})"
+
         if not self.has_cuda:
             note += "  •  no NVIDIA GPU found"
+        elif device == "cuda":
+            # only the size of the card is judged here. what is free right now
+            # is asked at the start of a run, it changes by the second
+            short = vram_problem(self.chosen_model()[0], live=False)
+            if short:
+                note += f"\nToo small for this model ({short}), it will use the CPU"
+
         self.device_note.config(text=note)
 
     def select_input(self):
         path = filedialog.askopenfilename(
-            filetypes=[("Media", "*.mp4 *.mkv *.mov *.webm *.wav *.mp3 *.m4a *.flac *.ogg")])
+            filetypes=[("Media", type_filter()), ("All files", "*.*")])
         if path:
             self.input_path = path
             self.input_label.config(text=os.path.basename(path))
+            self.update_burn_state()
 
     def select_output(self):
         path = filedialog.askdirectory()
@@ -577,10 +981,48 @@ class Main:
         if "progress" in latest:
             self.progress.config(value=latest["progress"])
         if "busy" in latest:
-            self.start_button.config(
-                state="disabled" if latest["busy"] else "normal")
+            busy = latest["busy"]
+            self.start_button.config(state="disabled" if busy else "normal")
+            self.stop_button.config(state="normal" if busy else "disabled")
 
         self.root.after(80, self.pump)
+
+    # Stop, and the pieces the worker thread uses to react to it
+
+    def stop(self):
+        if not self.running:
+            return
+        self.cancel.set()
+        self.set_status("Stopping...")
+        self.kill_child()
+
+    # ending the running child is what makes Stop take effect immediately
+    # instead of at the next step
+    def register_child(self, process):
+        with self.child_lock:
+            self.child = process
+        if self.cancel.is_set():
+            self.kill_child()
+
+    def kill_child(self):
+        with self.child_lock:
+            process = self.child
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    def forget_child(self):
+        with self.child_lock:
+            self.child = None
+
+    def stopped(self):
+        return self.cancel.is_set()
+
+    def check_cancel(self):
+        if self.cancel.is_set():
+            raise Cancelled()
 
     def normalize(self, path):
         return os.path.abspath(os.path.normpath(path))
@@ -597,7 +1039,9 @@ class Main:
             return
 
         self.running = True
-        self.start_button.config(state="disabled")
+        self.cancel.clear()
+        self.forget_child()
+        self.set_busy(True)
         self.set_progress(0)
         threading.Thread(target=self.deeper_process, daemon=True).start()
 
@@ -605,25 +1049,41 @@ class Main:
     def get_model(self, model_name, size_hint, device, compute_type):
         if not model_is_ready(model_name):
             self.set_status(f"Downloading model ({size_hint}), one time only...")
-            download_model(model_name, self.set_progress)
+            try:
+                download_model(model_name, self.set_progress,
+                               self.register_child)
+            except Exception:
+                # a download that was killed by Stop looks exactly like one
+                # that broke, and it should not be reported as a failure
+                self.check_cancel()
+                raise
+            finally:
+                self.forget_child()
+            self.check_cancel()
             self.set_progress(0)
 
         key = (model_name, device, compute_type)
         if self.model is not None and self.loaded_key == key:
             return self.model
 
-        self.model = None
-        self.loaded_key = None
+        self.release_model()
         self.set_status("Loading model...")
         model = WhisperModel(
             model_dir(model_name),
             device=device,
             compute_type=compute_type,
-            cpu_threads=os.cpu_count() or 4,
+            cpu_threads=cpu_threads(),
         )
         self.model = model
         self.loaded_key = key
         return model
+
+    # dropping the reference is what frees the video memory again, which
+    # matters before a second attempt on a card that just ran out
+    def release_model(self):
+        self.model = None
+        self.loaded_key = None
+        gc.collect()
 
     def burn_step(self, name, srt_path, duration, device):
         if not self.ffmpeg:
@@ -637,11 +1097,99 @@ class Main:
         self.set_progress(0)
 
         burned = os.path.join(self.output_path, f"{name}_subbed.mp4")
-        burn_subtitles(self.ffmpeg, self.input_path, srt_path, burned,
-                       duration, self.set_progress, use_gpu)
+        try:
+            burn_subtitles(self.ffmpeg, self.input_path, srt_path, burned,
+                           duration, self.set_progress, use_gpu,
+                           self.register_child, self.stopped)
+        except Cancelled:
+            # a half encoded video cannot be played, so it does not stay
+            try:
+                os.remove(burned)
+            except OSError:
+                pass
+            raise
+        finally:
+            self.forget_child()
 
         self.set_progress(100)
         return f"Completed! Subtitles burned into {os.path.basename(burned)}"
+
+    # everything from loading the model to the finished srt. it is one method
+    # so the whole thing can be repeated on the processor when the card fails
+    def transcribe_to_srt(self, model_name, size_hint, device, compute_type,
+                          srt_path):
+        model = self.get_model(model_name, size_hint, device, compute_type)
+        self.check_cancel()
+
+        self.set_status("Processing audio...")
+
+        # none = auto-detect, one = forced, several = detected per segment
+        codes = self.selected_codes
+        language = codes[0] if len(codes) == 1 else None
+        multilingual = len(codes) > 1
+
+        # the voice filter is trained on speech and drops singing over
+        # instruments before the model hears it. switching it off is the only
+        # way to get all of a song, and batching needs it, so that run goes
+        # through the file the slower way
+        music = self.music.get()
+        if music:
+            engine = model
+            batch_size = 0
+            extra = {"vad_filter": False}
+        else:
+            # batching helps on both devices, only the size has to suit the
+            # machine: the card gets what its memory allows, the processor a
+            # fixed amount
+            engine = BatchedInferencePipeline(model=model)
+            batch_size = gpu_batch_size() if device == "cuda" else CPU_BATCH_SIZE
+            extra = {"vad_filter": True, "batch_size": batch_size}
+
+        # condition_on_previous_text=False avoids repetition loops, and
+        # word_timestamps is what the cue splitting in subtitles.py needs,
+        # without it whisper returns half a minute of speech as one block
+        segments, info = engine.transcribe(
+            self.input_path,
+            language=language,
+            multilingual=multilingual,
+            beam_size=5,
+            condition_on_previous_text=False,
+            word_timestamps=True,
+            **extra,
+        )
+
+        self.set_status("Writing subtitles...")
+
+        # segments stream in, so cues are cut and written as they arrive
+        total = info.duration or 0
+        written = 0
+        covered = 0.0
+        with open(srt_path, "w", encoding="utf-8") as f:
+            cues = cues_from_segments(segments, self.subtitle_style.get())
+            for i, cue in enumerate(cues, 1):
+                # the only place a long run can be stopped, and cues arrive
+                # often enough that it feels immediate
+                self.check_cancel()
+                write_srt_entry(f, i, cue["start"], cue["end"], cue["text"])
+                written = i
+                covered += cue["end"] - cue["start"]
+                if total:
+                    self.set_progress(min(100, cue["end"] / total * 100))
+
+        # a run that turned only a fraction of the file into subtitles was
+        # filtered rather than silent, and that is worth saying
+        self.hint = ""
+        if not music and total and covered < total * MIN_COVERAGE:
+            self.hint = (f"  Only {covered / total * 100:.0f}% of it was heard "
+                         f"as speech — if there is singing in this, tick "
+                         f"'Music or singing' and run it again.")
+
+        mode = "music mode" if music else f"batch {batch_size}"
+        share = f", {covered / total * 100:.0f}% covered" if total else ""
+        log(f"{os.path.basename(self.input_path)}: {model_name} on {device} "
+            f"({compute_type}, {mode}), {total:.0f}s audio, "
+            f"{written} cues{share}")
+        return info
 
     def deeper_process(self):
         try:
@@ -650,74 +1198,113 @@ class Main:
             name = os.path.splitext(os.path.basename(self.input_path))[0]
             srt_path = os.path.join(self.output_path, f"{name}_subs.srt")
 
-            choice = self.model_choice.get()
-            model_name, size_hint = next(
-                (short, size) for label, short, size in MODELS if label == choice)
-
+            model_name, size_hint = self.chosen_model()
             device, compute_type = device_settings(self.device_choice.get())
-            model = self.get_model(model_name, size_hint, device, compute_type)
 
-            self.set_status("Processing audio...")
-
-            # none = auto-detect, one = forced, several = detected per segment
-            codes = self.selected_codes
-            language = codes[0] if len(codes) == 1 else None
-            multilingual = len(codes) > 1
-
-            # batching only pays off on the GPU, on the CPU it just costs memory
+            # a card without the memory for this model ends the whole app
+            # instead of reporting an error, so it never gets that far.
+            # a model that is already loaded holds its memory, only a fresh
+            # one has to fit alongside whatever else is on the card
             if device == "cuda":
-                engine = BatchedInferencePipeline(model=model)
-                extra = {"batch_size": 16}
-            else:
-                engine = model
-                extra = {}
+                if self.loaded_key != (model_name, device, compute_type):
+                    self.release_model()
+                    short = vram_problem(model_name)
+                else:
+                    short = None
+                if short:
+                    log(f"not using the card for {model_name}: {short}")
+                    self.set_status(f"Using the processor instead: {short}.")
+                    device, compute_type = "cpu", CPU_COMPUTE_TYPE
 
-            # vad_filter drops silence before it reaches the model, and
-            # condition_on_previous_text=False avoids repetition loops
-            # word_timestamps is what the cue splitting in subtitles.py needs,
-            # without it whisper returns half a minute of speech as one block
-            segments, info = engine.transcribe(
-                self.input_path,
-                language=language,
-                multilingual=multilingual,
-                beam_size=5,
-                vad_filter=True,
-                condition_on_previous_text=False,
-                word_timestamps=True,
-                **extra,
-            )
-
-            self.set_status("Writing subtitles...")
-
-            # segments stream in, so cues are cut and written as they arrive
-            total = info.duration or 0
-            with open(srt_path, "w", encoding="utf-8") as f:
-                cues = cues_from_segments(segments, self.subtitle_style.get())
-                for i, cue in enumerate(cues, 1):
-                    write_srt_entry(f, i, cue["start"], cue["end"], cue["text"])
-                    if total:
-                        self.set_progress(min(100, cue["end"] / total * 100))
+            try:
+                info = self.transcribe_to_srt(model_name, size_hint, device,
+                                              compute_type, srt_path)
+            except (Cancelled, KeyboardInterrupt, DownloadFailed):
+                raise
+            except Exception as problem:
+                # anything the card throws is worth another try on the
+                # processor, which is slower but always there
+                if device != "cuda":
+                    raise
+                log(f"the card failed on {model_name}: {problem!r}")
+                self.set_status("The graphics card couldn't do it, "
+                                "starting over on the processor...")
+                self.release_model()
+                device, compute_type = "cpu", CPU_COMPUTE_TYPE
+                info = self.transcribe_to_srt(model_name, size_hint, device,
+                                              compute_type, srt_path)
 
             self.set_progress(100)
 
             done = "Completed!"
-            if not codes:
+            if not self.selected_codes:
                 done += f"  (detected: {language_name(info.language)})"
+            done += self.hint
 
             if self.burn.get():
                 done = self.burn_step(name, srt_path, info.duration, device)
 
             self.set_status(done)
 
+        except Cancelled:
+            log("stopped by the user")
+            self.set_status("Stopped. What was written so far was kept.")
+            self.set_progress(0)
+
+        except DownloadFailed as problem:
+            log(f"download failed: {problem}")
+            self.set_status(f"Couldn't get the model, check your internet "
+                            f"connection. ({problem})")
+            self.set_progress(0)
+
         except Exception as e:
             # show the reason in the status line instead of failing silently
+            log(f"failed: {e!r}")
             self.set_status(f"Failed: {e}")
 
         finally:
+            self.forget_child()
             self.running = False
             self.set_busy(False)
 
+# the console window belongs to the batch file. it is worth seeing while the
+# app starts up, and only in the way afterwards, so it is put away once the
+# window is there. SERAsubs.bat sets the variable, which means a terminal
+# someone opened themselves is never touched
+def set_console_visible(visible):
+    if os.environ.get("SERASUBS_LAUNCHER") != "1":
+        return
+    try:
+        import ctypes
+        console = ctypes.windll.kernel32.GetConsoleWindow()
+        if console:
+            ctypes.windll.user32.ShowWindow(console, 5 if visible else 0)
+    except Exception as problem:
+        log(f"could not hide the console: {problem}")
+
+
+# windows groups the taskbar button and its icon by this id. without it the
+# app borrows the one belonging to the python runtime
+def set_taskbar_identity():
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_NAME)
+    except Exception as problem:
+        log(f"could not set the taskbar identity: {problem}")
+
+
 if __name__ == "__main__":
-    root = tk.Tk()
+    set_taskbar_identity()
+    # className is the name the window itself reports
+    root = tk.Tk(className=APP_NAME)
     Main(root)
-    root.mainloop()
+
+    # everything loaded, so the console has nothing left to show
+    root.after(600, lambda: set_console_visible(False))
+
+    try:
+        root.mainloop()
+    except BaseException:
+        # whatever went wrong has to stay readable
+        set_console_visible(True)
+        raise

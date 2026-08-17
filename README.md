@@ -1,9 +1,17 @@
-# SERAsubs
+# SERAsubs-modified-
 
 Offline auto-transcription for Windows. Give it a video or audio file, get a timed `.srt`
 back, optionally burned into the video. Made for clipping workflows.
 
 This is a fork of [seraotonin/SERAsubs](https://github.com/seraotonin/SERAsubs).
+
+## Formats
+
+    Video   mp4, mkv, mov, webm, avi, m4v, ts
+    Audio   mp3, wav, m4a, flac, ogg, opus, aac, wma
+
+The same list sits behind the ⓘ next to **Select file** in the window. Subtitles can only be
+burned into video, so with an audio file that checkbox switches itself off.
 
 ## Install
 
@@ -24,12 +32,37 @@ ffmpeg is included in the release, you do not need to install anything else.
 - Burns subtitles into the video
 - All 100 Whisper languages, pick several for clips that switch mid-sentence
 - One start file, dependencies and models fetched on demand (Instead of downloading from Google Drive, directly via Hugging Face)
+- A Stop button that ends the run, the model download or the encode behind it
+- A music mode for singing, which the speech filter would otherwise throw away
+- Checks the card before starting, size and what is free right now, and falls back to
+  the processor with a reason instead of dying halfway through
+
+## Music and singing
+
+The speech filter that skips silence also treats singing over instruments as noise, and on a
+song it can drop more than half the track before the model ever hears it. Tick **Music or
+singing** for those. It goes through the whole file instead, which is slower, and the largest
+model is worth picking here.
+
+Expect fewer correct words than on speech either way. Whisper is a speech model, and sung
+vocals, especially in an invented or heavily stylised language, are close to its limit.
+
+## When something goes wrong
+
+Every run writes a line to `serasubs.log` next to `SERAsubs.bat`: which file, which model,
+which device, how many subtitles came out, and the reason if it stopped. That file is what
+to attach when reporting a problem.
 
 ## Without an NVIDIA card
 
 Everything still works, it is just slower. Transcription runs on the processor, and burning
 subtitles in uses ffmpeg's normal x264 encoder instead of the card's, which is the slow part.
 The setup skips the GPU libraries in that case, which also makes the install about 2 GB smaller.
+
+A card with very little memory is treated the same way: the setup says so and skips the GPU
+libraries rather than downloading two gigabytes for something that cannot hold a model.
+`--gpu` installs them anyway. If a card is big enough but busy with other programs, the run
+falls back to the processor and the window names the programs sitting on it.
 
 ## Options
 
@@ -45,11 +78,18 @@ CTranslate2 conversions of OpenAI's Whisper weights, and land in the `models` fo
 ## Development
 
     app\      serasubs.py (window + transcription), subtitles.py (cue splitting),
-              languages.py, install.py
+              languages.py, install.py (first-run setup),
+              make_launcher.py (names the runtime copy)
     tools\    make_release.py, builds the release zip
 
-With Python 3.11+ and tkinter: `pip install -r app\requirements.txt`, then
-`python app\serasubs.py`.
+faster-whisper asks for Python 3.9 or newer; the release ships 3.13. With your own Python
+and tkinter: `pip install -r app\requirements.txt`, then `python app\serasubs.py`.
+
+`SERAsubs.bat` runs the app through `python\SERAsubs-modified-.exe`, a copy of the runtime with its
+version resource rewritten, so the task manager shows the app instead of a python. The copy
+is made on the machine it runs on, never shipped. Started directly with `python`, the app
+behaves the same, it just keeps the name of whatever started it and leaves your terminal
+alone.
 
 ### ffmpeg
 

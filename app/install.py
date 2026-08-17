@@ -17,6 +17,9 @@ ROOT_DIR = os.path.dirname(APP_DIR)
 
 MODEL_NAMES = ["base", "small", "large-v3"]
 
+# kept in step with APP_NAME in serasubs.py
+NAME = "SERAsubs-modified-"
+
 # pip output that means nothing to someone who just wants subtitles
 PIP_NOISE = (
     "Requirement already satisfied",
@@ -59,26 +62,65 @@ def line(text=""):
     print(text, flush=True)
 
 
-# nvidia-smi ships with every driver, so if it reports a GPU there is one
-def find_nvidia_gpu():
-    candidates = [
-        "nvidia-smi",
-        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
-                     "System32", "nvidia-smi.exe"),
-        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
-    ]
-    for exe in candidates:
+NVIDIA_SMI = [
+    "nvidia-smi",
+    os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                 "System32", "nvidia-smi.exe"),
+    r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+]
+
+# the smallest model needs about a gigabyte of video memory on top of what
+# windows itself is already using. below this the CUDA libraries are two
+# gigabytes downloaded for nothing
+MIN_USEFUL_VRAM_MB = 2000
+
+# what the largest model needs, kept in step with MODEL_VRAM_MB in serasubs.py
+LARGE_MODEL_VRAM_MB = 4600
+
+
+def ask_nvidia_smi(fields):
+    for exe in NVIDIA_SMI:
         try:
-            done = subprocess.run([exe, "-L"], capture_output=True,
-                                  text=True, timeout=30)
+            done = subprocess.run(
+                [exe, f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
             continue
-        if done.returncode == 0 and "GPU 0" in done.stdout:
-            # "GPU 0: NVIDIA GeForce RTX 4090 (UUID: ...)" down to the name
-            first = done.stdout.strip().splitlines()[0]
-            name = first.split(":", 1)[-1].split("(UUID")[0]
-            return name.strip()
+        if done.returncode == 0 and done.stdout.strip():
+            return [part.strip()
+                    for part in done.stdout.strip().splitlines()[0].split(",")]
     return None
+
+
+# nvidia-smi ships with every driver, so if it reports a GPU there is one.
+# how much memory it has decides whether the CUDA parts are worth installing
+def find_nvidia_gpu():
+    answer = ask_nvidia_smi("name,memory.total")
+    if not answer or len(answer) < 2:
+        return None
+    try:
+        memory = int(float(answer[1]))
+    except ValueError:
+        return None
+
+    card = {"name": answer[0], "memory_mb": memory, "compute": None}
+
+    # older drivers fail the whole query on this field, so it is asked for
+    # on its own and simply left out when it isn't known
+    capability = ask_nvidia_smi("compute_cap")
+    if capability:
+        try:
+            card["compute"] = float(capability[0])
+        except ValueError:
+            pass
+    return card
+
+
+def describe(card):
+    text = f"{card['name']}, {card['memory_mb'] / 1024:.1f} GB"
+    if card["compute"]:
+        text += f", compute {card['compute']:g}"
+    return text
 
 
 # runs pip quietly, and on failure shows the last few lines, which are the
@@ -148,7 +190,7 @@ def download_model(model_name):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Set up SERAsubs.")
+    parser = argparse.ArgumentParser(description=f"Set up {NAME}.")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--gpu", action="store_true",
                        help="install the CUDA libraries even without a detected GPU")
@@ -159,7 +201,7 @@ def main():
     args = parser.parse_args()
 
     line()
-    line("  Setting up SERAsubs")
+    line(f"  Setting up {NAME}")
     line("  This only happens once. Grab a drink, it takes a few minutes.")
     line("  " + "-" * 56)
     line()
@@ -170,10 +212,30 @@ def main():
         line("Graphics card: skipping it, you asked for the CPU version")
     elif args.gpu:
         want_gpu = True
-        line(f"Graphics card: {gpu or 'none found, installing the GPU parts anyway'}")
+        line("Graphics card: " + (describe(gpu) if gpu else
+                                  "none found, installing the GPU parts anyway"))
+    elif not gpu:
+        want_gpu = False
+        line("Graphics card: none found, so this will run on your processor")
     else:
-        want_gpu = gpu is not None
-        line(f"Graphics card: {gpu or 'none found, so this will run on your processor'}")
+        line(f"Graphics card: {describe(gpu)}")
+        # a card this small cannot hold a model, and finding that out after
+        # a two gigabyte download helps nobody
+        want_gpu = gpu["memory_mb"] >= MIN_USEFUL_VRAM_MB
+        if not want_gpu:
+            line()
+            line("   That card has too little memory to run the transcription")
+            line(f"   on ({gpu['memory_mb'] / 1024:.1f} GB, at least "
+                 f"{MIN_USEFUL_VRAM_MB / 1024:.1f} GB is needed). The two")
+            line("   gigabytes of CUDA libraries are being skipped,")
+            line(f"   {NAME} will use your processor instead.")
+            line("   Run  SERAsubs.bat --gpu  to install them anyway.")
+
+    if want_gpu and gpu and gpu["compute"] and gpu["compute"] < 7.0:
+        line()
+        line(f"   Note: this card is older than the ones float16 needs, so it")
+        line(f"   runs in a slower mode. It still works.")
+
     line()
 
     line("Installing the transcription engine ...")
@@ -187,7 +249,7 @@ def main():
         line()
         line("Installing the graphics card support (about 2 GB, be patient) ...")
         if not pip_install(os.path.join(APP_DIR, "requirements-gpu.txt")):
-            line("   couldn't install it, SERAsubs will use the processor instead")
+            line(f"   couldn't install it, {NAME} uses the processor instead")
             want_gpu = False
         else:
             line("   done")
@@ -197,6 +259,12 @@ def main():
         works, problems = cuda_really_works()
         if works:
             line("Checked the graphics card: it works, transcription will be fast.")
+            # the largest model is the one that will not fit on a small card,
+            # better said now than when a run dies halfway through
+            if gpu and gpu["memory_mb"] < LARGE_MODEL_VRAM_MB:
+                line(f"   The 'Slowest (Higher accuracy)' model needs about "
+                     f"{LARGE_MODEL_VRAM_MB / 1024:.1f} GB and won't fit,")
+                line(f"   {NAME} will quietly use your processor for that one.")
         else:
             line("Checked the graphics card: it can't be used, falling back to the")
             line("processor. This usually means the NVIDIA driver is too old.")
@@ -211,7 +279,7 @@ def main():
 
     line()
     line("  " + "-" * 56)
-    line("  Ready. SERAsubs is starting.")
+    line(f"  Ready. {NAME} is starting.")
     line()
     return 0
 

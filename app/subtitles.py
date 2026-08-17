@@ -155,13 +155,18 @@ def _natural_chunks(words):
     return chunks
 
 
+# how many cues a piece of text has to become to stay within the limits
+def _piece_count_for(length, span, limit, max_seconds):
+    return max(1,
+               math.ceil(length / (limit * MAX_LINES)),
+               math.ceil(span / max_seconds))
+
+
 # how many cues this chunk has to become to stay within the limits
 def _piece_count(words, limit, max_seconds):
     length = len("".join(w.word for w in words).strip())
     span = words[-1].end - words[0].start
-    return max(1,
-               math.ceil(length / (limit * MAX_LINES)),
-               math.ceil(span / max_seconds))
+    return _piece_count_for(length, span, limit, max_seconds)
 
 
 # second pass: split an oversized chunk into equal pieces rather than
@@ -208,6 +213,65 @@ def cues_from_words(words, limit, max_seconds):
     return groups
 
 
+# the smallest units a line may be broken at, and what joins them back
+# together: spaces between latin words, nothing between japanese characters
+def _units(text):
+    if looks_cjk(text):
+        return _cjk_pieces(text), ""
+    return text.split(), " "
+
+
+# splits plain text into roughly equal parts, preferring a sentence or
+# clause end near the target over an arbitrary cut
+def _split_text(text, pieces):
+    units, glue = _units(text)
+    if pieces <= 1 or len(units) <= 1:
+        return [text.strip()]
+
+    target = len(text) / pieces
+    parts = []
+    current = ""
+
+    for unit in units:
+        current = (current + glue + unit).strip() if current else unit.strip()
+
+        # never produce more parts than were decided on
+        if len(parts) == pieces - 1:
+            continue
+
+        if len(current) >= target or (len(current) >= target * 0.6
+                                      and _ends_with(current,
+                                                     SENTENCE_ENDS + CLAUSE_ENDS)):
+            parts.append(current)
+            current = ""
+
+    if current:
+        parts.append(current)
+    return parts
+
+
+# a segment without word timestamps still has to be cut, otherwise half a
+# minute of speech ends up in one cue. the time is shared out by how much
+# text each part carries, which is an estimate but stays readable
+def _cues_without_words(segment, limit, max_seconds):
+    text = segment.text.strip()
+    if not text:
+        return []
+
+    start = float(segment.start)
+    span = max(0.0, float(segment.end) - start)
+    parts = _split_text(text, _piece_count_for(len(text), span, limit,
+                                               max_seconds))
+
+    total = sum(len(part) for part in parts) or 1
+    cues = []
+    for part in parts:
+        end = min(float(segment.end), start + span * len(part) / total)
+        cues.append({"start": start, "end": max(end, start), "text": wrap(part, limit)})
+        start = end
+    return cues
+
+
 # turns a group of words into the cue that gets written out
 def _finish(group, limit):
     text = "".join(w.word for w in group).strip()
@@ -239,16 +303,14 @@ def cues_from_segments(segments, style_name=DEFAULT_STYLE):
     for segment in segments:
         words = getattr(segment, "words", None)
 
-        # without word timestamps, fall back to using the segment as one cue
-        # rather than dropping it
+        # whisper does not always return word timestamps, and a segment can
+        # be half a minute long, so it is cut by length and time instead
         if not words:
-            text = segment.text.strip()
-            if text:
-                yield {
-                    "start": float(segment.start),
-                    "end": float(segment.end),
-                    "text": wrap(text, line_limit(text, style)),
-                }
+            limit = line_limit(segment.text, style)
+            for cue in stretch_short_cues(
+                    _cues_without_words(segment, limit, style["seconds"])):
+                if cue["text"]:
+                    yield cue
             continue
 
         limit = line_limit(segment.text, style)
