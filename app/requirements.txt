@@ -1,0 +1,3 @@
+# the whole engine. everything else in here is something faster-whisper
+# drags in by itself (ctranslate2, onnxruntime, av, huggingface-hub, ...)
+faster-whisper>=1.2,<2

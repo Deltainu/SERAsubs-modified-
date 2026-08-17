@@ -1,11 +1,10 @@
-ffmpeg/doc/
-ffmpeg/presets/
-__pycache__/
-
+python/
 models/
 ffmpeg/
-python/
-
+dist/
+.venv/
+venv/
+__pycache__/
 *.pyc
 *.pyo
 *.pyd

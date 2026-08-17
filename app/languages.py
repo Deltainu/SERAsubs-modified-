@@ -1,0 +1,126 @@
+# every language code Whisper supports, mapped to a display name
+
+LANGUAGES = {
+    "af": "Afrikaans",
+    "am": "Amharic",
+    "ar": "Arabic",
+    "as": "Assamese",
+    "az": "Azerbaijani",
+    "ba": "Bashkir",
+    "be": "Belarusian",
+    "bg": "Bulgarian",
+    "bn": "Bengali",
+    "bo": "Tibetan",
+    "br": "Breton",
+    "bs": "Bosnian",
+    "ca": "Catalan",
+    "cs": "Czech",
+    "cy": "Welsh",
+    "da": "Danish",
+    "de": "German",
+    "el": "Greek",
+    "en": "English",
+    "es": "Spanish",
+    "et": "Estonian",
+    "eu": "Basque",
+    "fa": "Persian",
+    "fi": "Finnish",
+    "fo": "Faroese",
+    "fr": "French",
+    "gl": "Galician",
+    "gu": "Gujarati",
+    "ha": "Hausa",
+    "haw": "Hawaiian",
+    "he": "Hebrew",
+    "hi": "Hindi",
+    "hr": "Croatian",
+    "ht": "Haitian Creole",
+    "hu": "Hungarian",
+    "hy": "Armenian",
+    "id": "Indonesian",
+    "is": "Icelandic",
+    "it": "Italian",
+    "ja": "Japanese",
+    "jw": "Javanese",
+    "ka": "Georgian",
+    "kk": "Kazakh",
+    "km": "Khmer",
+    "kn": "Kannada",
+    "ko": "Korean",
+    "la": "Latin",
+    "lb": "Luxembourgish",
+    "ln": "Lingala",
+    "lo": "Lao",
+    "lt": "Lithuanian",
+    "lv": "Latvian",
+    "mg": "Malagasy",
+    "mi": "Maori",
+    "mk": "Macedonian",
+    "ml": "Malayalam",
+    "mn": "Mongolian",
+    "mr": "Marathi",
+    "ms": "Malay",
+    "mt": "Maltese",
+    "my": "Myanmar",
+    "ne": "Nepali",
+    "nl": "Dutch",
+    "nn": "Nynorsk",
+    "no": "Norwegian",
+    "oc": "Occitan",
+    "pa": "Punjabi",
+    "pl": "Polish",
+    "ps": "Pashto",
+    "pt": "Portuguese",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "sa": "Sanskrit",
+    "sd": "Sindhi",
+    "si": "Sinhala",
+    "sk": "Slovak",
+    "sl": "Slovenian",
+    "sn": "Shona",
+    "so": "Somali",
+    "sq": "Albanian",
+    "sr": "Serbian",
+    "su": "Sundanese",
+    "sv": "Swedish",
+    "sw": "Swahili",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "tg": "Tajik",
+    "th": "Thai",
+    "tk": "Turkmen",
+    "tl": "Tagalog",
+    "tr": "Turkish",
+    "tt": "Tatar",
+    "uk": "Ukrainian",
+    "ur": "Urdu",
+    "uz": "Uzbek",
+    "vi": "Vietnamese",
+    "yi": "Yiddish",
+    "yo": "Yoruba",
+    "yue": "Cantonese",
+    "zh": "Chinese",
+}
+
+# pinned to the top of the list, everything else is sorted by name
+FAVOURITES = ["ja", "en", "de"]
+
+
+# the list is built from the codes the installed engine reports, so a
+# language it gained cannot silently go missing here
+def language_choices(supported_codes=None):
+    codes = set(LANGUAGES)
+    if supported_codes:
+        codes = set(supported_codes)
+
+    favourites = [c for c in FAVOURITES if c in codes]
+    rest = sorted(
+        (c for c in codes if c not in favourites),
+        key=lambda c: language_name(c).lower(),
+    )
+    return favourites + rest
+
+
+def language_name(code):
+    return LANGUAGES.get(code, code)

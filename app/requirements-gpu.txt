@@ -1,0 +1,4 @@
+# only installed when there's actually an nvidia card in the machine.
+# roughly 2 GB, which is a lot to hand someone who can't even use it
+nvidia-cublas-cu12>=12.3
+nvidia-cudnn-cu12>=9.1,<10
