@@ -22,7 +22,7 @@ from tkinter import filedialog, messagebox, ttk
 from languages import language_choices, language_name
 from subtitles import cues_from_segments, DEFAULT_STYLE, STYLES
 
-__version__ = "2.0"
+__version__ = "1.0"
 
 
 # This cat was original placed by Sera.

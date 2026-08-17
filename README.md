@@ -7,7 +7,7 @@ This is a fork of [seraotonin/SERAsubs](https://github.com/seraotonin/SERAsubs).
 
 ## Install
 
-Download `SERAsubs-x.x.zip` from Releases, extract it properly (right click, Extract All,
+Download `SERAsubs-modified-x.x.zip` from Releases, extract it properly (right click, Extract All,
 don't drag the files out), and run **SERAsubs.bat**. That is the only file to click.
 
 The first launch sets itself up: it checks for an NVIDIA card, installs only the parts your
@@ -23,7 +23,7 @@ ffmpeg is included in the release, you do not need to install anything else.
 - Cuts subtitles to readable length using word timings, with a size setting for burn-in
 - Burns subtitles into the video
 - All 100 Whisper languages, pick several for clips that switch mid-sentence
-- One start file, dependencies and models fetched on demand: 55 MB download instead of 6 GB
+- One start file, dependencies and models fetched on demand (Instead of downloading from Google Drive, directly via Hugging Face)
 
 ## Without an NVIDIA card
 

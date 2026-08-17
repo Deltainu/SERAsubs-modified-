@@ -156,7 +156,7 @@ def main():
     args = parser.parse_args()
 
     version = read_version()
-    name = f"SERAsubs-{version}"
+    name = f"SERAsubs-modified-{version}"
     out_dir = os.path.join(APP_DIR, args.out)
     staging = os.path.join(out_dir, name)
 
