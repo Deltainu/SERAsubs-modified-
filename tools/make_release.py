@@ -48,6 +48,7 @@ SKIP_IN_PYTHON = {
     os.path.join("Lib", "test"),
     os.path.join("Lib", "idlelib"),
     "SERAsubs-modified-.exe",
+    "pip-cache",
 }
 
 # ffmpeg ships three large executables and only one of them is used.

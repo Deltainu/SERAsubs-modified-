@@ -9,11 +9,18 @@
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(APP_DIR)
+
+# pip and the hub library both keep a cache in the user profile by default,
+# and the graphics card libraries alone would leave two gigabytes there.
+# both are pointed inside the folder, so deleting it removes everything
+PIP_CACHE = os.path.join(ROOT_DIR, "python", "pip-cache")
+os.environ.setdefault("HF_HOME", os.path.join(ROOT_DIR, "models", ".hub"))
 
 MODEL_NAMES = ["base", "small", "large-v3"]
 
@@ -127,7 +134,8 @@ def describe(card):
 # ones that say what actually went wrong
 def pip_install(requirements):
     command = [sys.executable, "-m", "pip", "install", "--no-input",
-               "--disable-pip-version-check", "-r", requirements]
+               "--disable-pip-version-check", "--cache-dir", PIP_CACHE,
+               "-r", requirements]
 
     process = subprocess.Popen(command, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True)
@@ -276,6 +284,10 @@ def main():
     if args.model:
         line()
         download_model(args.model)
+
+    # kept until here so a second attempt after a failure is quick, and
+    # dropped once there is nothing left to retry
+    shutil.rmtree(PIP_CACHE, ignore_errors=True)
 
     line()
     line("  " + "-" * 56)

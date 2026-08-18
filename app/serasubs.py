@@ -65,6 +65,10 @@ MODEL_REPO = "Systran/faster-whisper-{}"
 MODEL_PATTERNS = ("*.bin", "*.json", "*.txt", "*.model")
 MODEL_PATTERNS_SUFFIX = tuple(p.lstrip("*") for p in MODEL_PATTERNS)
 
+# the hub library otherwise keeps its cache in the user profile. pointing
+# it inside the folder keeps everything the app leaves behind in one place
+os.environ.setdefault("HF_HOME", os.path.join(ROOT_DIR, "models", ".hub"))
+
 # int8 is the fastest a processor runs these weights, and this is where the
 # gain from batching flattens out
 CPU_COMPUTE_TYPE = "int8"
