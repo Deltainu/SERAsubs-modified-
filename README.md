@@ -25,6 +25,18 @@ see what it is doing. Nothing is ever uploaded, your clips stay on your machine.
 
 ffmpeg is included in the release, you do not need to install anything else.
 
+## Uninstall
+
+Delete the folder. That is the whole of it.
+
+Everything stays inside it: the python the app runs on, the packages the setup installs, the
+models it downloads, ffmpeg, and the log. Nothing goes into Windows itself, there is no
+installer, no registry entry, no PATH change and no start menu shortcut, and a python you
+already have is never used or changed. pip and Hugging Face would each keep a download cache
+in your user profile, and both are pointed into the folder instead, so they leave with it.
+
+The `.srt` files stay where they were saved, next to your clips.
+
 ## What this fork changes
 
 - Runs on the GPU through faster-whisper instead of CPU-only PyTorch
@@ -36,6 +48,7 @@ ffmpeg is included in the release, you do not need to install anything else.
 - A music mode for singing, which the speech filter would otherwise throw away
 - Checks the card before starting, size and what is free right now, and falls back to
   the processor with a reason instead of dying halfway through
+- Keeps to its own folder, caches included, so uninstalling is deleting it
 
 ## Music and singing
 
