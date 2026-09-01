@@ -10,3 +10,6 @@ __pycache__/
 *.pyd
 *.log
 serasubs.log
+*.mp4
+*.mov
+edo/

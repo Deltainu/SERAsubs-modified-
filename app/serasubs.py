@@ -12,6 +12,8 @@ import site
 import os
 import gc
 import glob
+import math
+import statistics
 import queue
 import shutil
 import subprocess
@@ -24,7 +26,7 @@ from tkinter import filedialog, messagebox, ttk
 from languages import language_choices, language_name
 from subtitles import cues_from_segments, DEFAULT_STYLE, STYLES
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 # what this fork is called, everywhere it shows: the window, the taskbar,
 # the task manager and the runtime it starts under
@@ -74,9 +76,33 @@ os.environ.setdefault("HF_HOME", os.path.join(ROOT_DIR, "models", ".hub"))
 CPU_COMPUTE_TYPE = "int8"
 CPU_BATCH_SIZE = 8
 
-# below this share of the file becoming subtitles, the voice filter is the
-# likely reason rather than silence
-MIN_COVERAGE = 0.5
+# share of the file with sound but no subtitles from which the music mode
+# is worth suggesting. speech with long pauses stays well below it,
+# swallowed singing well above
+MUSIC_HINT_SHARE = 0.35
+
+# level a place has to reach, relative to the median speech level, to count
+# as sound rather than as a pause
+LOUD_SHARE = 0.5
+
+# level that counts as sound when nothing was transcribed and there is no
+# speech to measure against. roughly -40 dBFS, above room noise
+SILENCE_FLOOR = 0.01
+
+# places sampled, seconds measured at each, and the rate they are resampled
+# to. a fixed number of seeks, so the cost does not grow with the length of
+# the file
+SOUND_SAMPLES = 60
+SOUND_WINDOW = 0.5
+SOUND_RATE = 16000
+
+# language detection reads 30-second windows from the start of the file, by
+# default a single one. an opening title or intro music carries no language
+# and that guess would still decide the whole run, so up to six windows are
+# read and the first above the confidence threshold wins. a file that opens
+# with speech stops at the first
+LANGUAGE_WINDOWS = 6
+LANGUAGE_CONFIDENCE = 0.9
 
 LOG_FILE = "serasubs.log"
 LOG_MAX_BYTES = 512 * 1024
@@ -164,6 +190,78 @@ def type_summary():
     return (f"Video:  {', '.join(s.lstrip('.') for s in VIDEO_TYPES)}\n"
             f"Audio:  {', '.join(s.lstrip('.') for s in AUDIO_TYPES)}\n\n"
             "Subtitles can only be burned into video.")
+
+
+# rms level at one spot. the container stays open across all spots, and
+# seeking keeps it cheap: only the measured fraction of a second is decoded
+def _loudness_at(container, stream, resampler, when, samples):
+    try:
+        container.seek(int(when / stream.time_base), stream=stream)
+    except Exception:
+        return None
+
+    total = 0.0
+    counted = 0
+    try:
+        for frame in container.decode(stream):
+            # a seek lands on or before the spot, anything well before it
+            # belongs to the previous one
+            if frame.time is not None and frame.time < when - 1.0:
+                continue
+            for piece in resampler.resample(frame):
+                values = piece.to_ndarray().reshape(-1).astype("float64")
+                total += float((values * values).sum())
+                counted += len(values)
+            if counted >= samples:
+                break
+    except Exception:
+        return None
+    return math.sqrt(total / counted) if counted else None
+
+
+# tells apart the two reasons a run subtitles only part of a file: the
+# voice filter dropped singing, or nobody was talking. samples the loudness
+# of the places no cue covers and returns their share of the file, or None
+# when the audio cannot be read
+def sound_without_subtitles(path, spoken, duration):
+    if duration <= 0:
+        return None
+    try:
+        import av
+    except ImportError:
+        return None
+
+    spots = [duration * (i + 0.5) / SOUND_SAMPLES for i in range(SOUND_SAMPLES)]
+    # a spot just outside a cue is still speech, the cue ends on the word
+    heard = [any(start - 0.25 <= spot <= end + 0.25 for start, end in spoken)
+             for spot in spots]
+
+    try:
+        with av.open(path) as container:
+            if not container.streams.audio:
+                return None
+            stream = container.streams.audio[0]
+            resampler = av.audio.resampler.AudioResampler(
+                format="flt", layout="mono", rate=SOUND_RATE)
+            wanted = int(SOUND_RATE * SOUND_WINDOW)
+            levels = [_loudness_at(container, stream, resampler, spot, wanted)
+                      for spot in spots]
+    except Exception as problem:
+        log(f"could not listen to {os.path.basename(path)}: {problem!r}")
+        return None
+
+    speech = [level for level, said in zip(levels, heard)
+              if said and level is not None]
+    silent = [level for level, said in zip(levels, heard)
+              if not said and level is not None]
+    if not silent:
+        return None
+
+    # the threshold comes from the file's own speech, so a quiet recording
+    # is not judged against a loud one. with no subtitles at all there is
+    # nothing to compare against, so a fixed floor stands in
+    floor = statistics.median(speech) * LOUD_SHARE if speech else SILENCE_FLOOR
+    return sum(1 for level in silent if level >= floor) / len(spots)
 
 
 # stops a console window appearing for every ffmpeg call
@@ -1133,9 +1231,9 @@ class Main:
         multilingual = len(codes) > 1
 
         # the voice filter is trained on speech and drops singing over
-        # instruments before the model hears it. switching it off is the only
-        # way to get all of a song, and batching needs it, so that run goes
-        # through the file the slower way
+        # instruments before the model sees it. it can only be switched off
+        # for the whole run, and batching requires it, so the music mode
+        # works through the file sequentially
         music = self.music.get()
         if music:
             engine = model
@@ -1159,6 +1257,8 @@ class Main:
             beam_size=5,
             condition_on_previous_text=False,
             word_timestamps=True,
+            language_detection_segments=LANGUAGE_WINDOWS,
+            language_detection_threshold=LANGUAGE_CONFIDENCE,
             **extra,
         )
 
@@ -1167,7 +1267,9 @@ class Main:
         # segments stream in, so cues are cut and written as they arrive
         total = info.duration or 0
         written = 0
-        covered = 0.0
+        # when subtitles are on screen. cues that touch or overlap are kept
+        # as one stretch, so nothing here is counted twice
+        spoken = []
         with open(srt_path, "w", encoding="utf-8") as f:
             cues = cues_from_segments(segments, self.subtitle_style.get())
             for i, cue in enumerate(cues, 1):
@@ -1176,23 +1278,33 @@ class Main:
                 self.check_cancel()
                 write_srt_entry(f, i, cue["start"], cue["end"], cue["text"])
                 written = i
-                covered += cue["end"] - cue["start"]
+                if spoken and cue["start"] <= spoken[-1][1]:
+                    spoken[-1][1] = max(spoken[-1][1], cue["end"])
+                else:
+                    spoken.append([cue["start"], cue["end"]])
                 if total:
                     self.set_progress(min(100, cue["end"] / total * 100))
 
-        # a run that turned only a fraction of the file into subtitles was
-        # filtered rather than silent, and that is worth saying
+        covered = sum(end - start for start, end in spoken)
+
+        # covered seconds alone cannot tell a swallowed song from a quiet
+        # file, so the hint goes by the loudness of the places without cues
         self.hint = ""
-        if not music and total and covered < total * MIN_COVERAGE:
-            self.hint = (f"  Only {covered / total * 100:.0f}% of it was heard "
-                         f"as speech — if there is singing in this, tick "
-                         f"'Music or singing' and run it again.")
+        noise = None
+        if not music and total:
+            noise = sound_without_subtitles(self.input_path, spoken, total)
+            if noise is not None and noise >= MUSIC_HINT_SHARE:
+                self.hint = (f"  {noise * 100:.0f}% of it has sound but no "
+                             f"subtitles — if that is singing, tick 'Music or "
+                             f"singing' and run it again.")
 
         mode = "music mode" if music else f"batch {batch_size}"
         share = f", {covered / total * 100:.0f}% covered" if total else ""
+        unheard = ("" if noise is None
+                   else f", {noise * 100:.0f}% sound without subtitles")
         log(f"{os.path.basename(self.input_path)}: {model_name} on {device} "
             f"({compute_type}, {mode}), {total:.0f}s audio, "
-            f"{written} cues{share}")
+            f"{written} cues{share}{unheard}")
         return info
 
     def deeper_process(self):
@@ -1246,7 +1358,10 @@ class Main:
             done += self.hint
 
             if self.burn.get():
-                done = self.burn_step(name, srt_path, info.duration, device)
+                # burn_step reports the video it wrote, which replaces the
+                # line above. the hint belongs on the end of that one too
+                done = self.burn_step(name, srt_path, info.duration,
+                                      device) + self.hint
 
             self.set_status(done)
 
