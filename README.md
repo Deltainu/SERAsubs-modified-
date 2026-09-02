@@ -123,6 +123,6 @@ have both, check with `ffmpeg -buildconf | findstr libass`.
 SERAsubs was created by [seraotonin](https://github.com/seraotonin). The idea, the original
 implementation and the name are theirs, and this fork is only built on top of that work.
 
-Speech recognition uses OpenAI's Whisper models, run through faster-whisper (CTranslate2).
+Speech recognition uses OpenAI's Whisper models, run through faster-whisper (CTranslate2) by [Systran](https://huggingface.co/Systran).
 
 Created in Collab with Claude Opus 5.
